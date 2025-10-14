@@ -1,0 +1,475 @@
+#include "parallel_verlet.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <float.h>
+#include <omp.h>
+#include "dependencies/include/GL/glew.h"
+
+// Grid parameters for spatial partitioning
+#define GRID_SIZE 32
+#define GRID_CELL_SIZE 2.0f
+
+// GPU buffer objects
+static GLuint positionSSBO = 0;
+static GLuint velocitySSBO = 0;
+static GLuint previousSSBO = 0;
+
+// ==================== PERFORMANCE METRICS ====================
+
+void initPerformanceMetrics(PerformanceMetrics* metrics)
+{
+    metrics->avgFps = 0.0;
+    metrics->minFps = DBL_MAX;
+    metrics->maxFps = 0.0;
+    metrics->avgPhysicsTime = 0.0;
+    metrics->maxObjects = 0;
+    metrics->totalFrames = 0;
+    metrics->totalPhysicsTime = 0.0;
+    metrics->fpsSum = 0.0;
+}
+
+void updatePerformanceMetrics(PerformanceMetrics* metrics, float dt, double physicsTime, int numObjects)
+{
+    double fps = 1.0 / dt;
+    metrics->fpsSum += fps;
+    metrics->totalFrames++;
+    metrics->totalPhysicsTime += physicsTime;
+    
+    if (fps < metrics->minFps) metrics->minFps = fps;
+    if (fps > metrics->maxFps) metrics->maxFps = fps;
+    if (numObjects > metrics->maxObjects) metrics->maxObjects = numObjects;
+    
+    metrics->avgFps = metrics->fpsSum / metrics->totalFrames;
+    metrics->avgPhysicsTime = metrics->totalPhysicsTime / metrics->totalFrames;
+}
+
+// ==================== OPENMP IMPLEMENTATIONS ====================
+
+void applyForcesOpenMP(VerletObject* objects, int count)
+{
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < count; i++) {
+        mfloat_t gravity[VEC3_SIZE] = {0.0f, -9.81f, 0.0f};
+        vec3_add(objects[i].acceleration, objects[i].acceleration, gravity);
+    }
+}
+
+void applyConstraintsOpenMP(VerletObject* objects, int count, mfloat_t* containerPos)
+{
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < count; i++) {
+        VerletObject* obj = &objects[i];
+        mfloat_t toObj[VEC3_SIZE];
+        vec3_subtract(toObj, obj->current, containerPos);
+        float dist = vec3_length(toObj);
+        
+        if (dist > CONTAINER_RADIUS - obj->radius) {
+            mfloat_t n[VEC3_SIZE];
+            vec3_normalize(n, toObj);
+            vec3_multiply_f(n, n, CONTAINER_RADIUS - obj->radius);
+            vec3_add(obj->current, containerPos, n);
+        }
+    }
+}
+
+void updatePositionsOpenMP(VerletObject* objects, int count, float dt)
+{
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < count; i++) {
+        VerletObject* obj = &objects[i];
+        mfloat_t velocity[VEC3_SIZE];
+        vec3_subtract(velocity, obj->current, obj->previous);
+        
+        vec3_assign(obj->previous, obj->current);
+        
+        mfloat_t accel_term[VEC3_SIZE];
+        vec3_multiply_f(accel_term, obj->acceleration, dt * dt);
+        vec3_add(obj->current, obj->current, velocity);
+        vec3_add(obj->current, obj->current, accel_term);
+        
+        vec3_zero(obj->acceleration);
+    }
+}
+
+void applyGridCollisionsOpenMP(VerletObject* objects, int count)
+{
+    // Spatial grid collision detection with OpenMP
+    const int gridDim = GRID_SIZE;
+    const float cellSize = GRID_CELL_SIZE;
+    const float invCellSize = 1.0f / cellSize;
+    
+    // Grid structure (simplified - thread-safe version)
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            mfloat_t diff[VEC3_SIZE];
+            vec3_subtract(diff, objects[i].current, objects[j].current);
+            float dist = vec3_length(diff);
+            float minDist = objects[i].radius + objects[j].radius;
+            
+            if (dist < minDist && dist > 0.0001f) {
+                mfloat_t n[VEC3_SIZE];
+                vec3_normalize(n, diff);
+                float delta = minDist - dist;
+                vec3_multiply_f(n, n, delta * 0.5f);
+                
+                #pragma omp critical
+                {
+                    vec3_add(objects[i].current, objects[i].current, n);
+                    vec3_subtract(objects[j].current, objects[j].current, n);
+                }
+            }
+        }
+    }
+}
+
+// ==================== PTHREAD IMPLEMENTATIONS ====================
+
+ParallelContext* initPthreadContext(int numThreads)
+{
+    ParallelContext* context = malloc(sizeof(ParallelContext));
+    context->threads = malloc(sizeof(pthread_t) * numThreads);
+    context->numThreads = numThreads;
+    pthread_barrier_init(&context->barrier, NULL, numThreads);
+    return context;
+}
+
+void freePthreadContext(ParallelContext* context)
+{
+    pthread_barrier_destroy(&context->barrier);
+    free(context->threads);
+    free(context);
+}
+
+void* applyForcesWorker(void* arg)
+{
+    ThreadWork* work = (ThreadWork*)arg;
+    
+    for (int i = work->startIdx; i < work->endIdx; i++) {
+        mfloat_t gravity[VEC3_SIZE] = {0.0f, -9.81f, 0.0f};
+        vec3_add(work->context->objects[i].acceleration, 
+                 work->context->objects[i].acceleration, gravity);
+    }
+    
+    return NULL;
+}
+
+void applyForcesPthread(VerletObject* objects, int count, ParallelContext* context)
+{
+    context->objects = objects;
+    context->numActive = count;
+    
+    int chunkSize = (count + context->numThreads - 1) / context->numThreads;
+    ThreadWork* works = malloc(sizeof(ThreadWork) * context->numThreads);
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        works[i].context = context;
+        works[i].threadId = i;
+        works[i].startIdx = i * chunkSize;
+        works[i].endIdx = (i + 1) * chunkSize;
+        if (works[i].endIdx > count) works[i].endIdx = count;
+        
+        pthread_create(&context->threads[i], NULL, applyForcesWorker, &works[i]);
+    }
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        pthread_join(context->threads[i], NULL);
+    }
+    
+    free(works);
+}
+
+void* applyConstraintsWorker(void* arg)
+{
+    ThreadWork* work = (ThreadWork*)arg;
+    
+    for (int i = work->startIdx; i < work->endIdx; i++) {
+        VerletObject* obj = &work->context->objects[i];
+        mfloat_t toObj[VEC3_SIZE];
+        vec3_subtract(toObj, obj->current, work->context->containerPos);
+        float dist = vec3_length(toObj);
+        
+        if (dist > CONTAINER_RADIUS - obj->radius) {
+            mfloat_t n[VEC3_SIZE];
+            vec3_normalize(n, toObj);
+            vec3_multiply_f(n, n, CONTAINER_RADIUS - obj->radius);
+            vec3_add(obj->current, work->context->containerPos, n);
+        }
+    }
+    
+    return NULL;
+}
+
+void applyConstraintsPthread(VerletObject* objects, int count, mfloat_t* containerPos, ParallelContext* context)
+{
+    context->objects = objects;
+    context->numActive = count;
+    context->containerPos = containerPos;
+    
+    int chunkSize = (count + context->numThreads - 1) / context->numThreads;
+    ThreadWork* works = malloc(sizeof(ThreadWork) * context->numThreads);
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        works[i].context = context;
+        works[i].threadId = i;
+        works[i].startIdx = i * chunkSize;
+        works[i].endIdx = (i + 1) * chunkSize;
+        if (works[i].endIdx > count) works[i].endIdx = count;
+        
+        pthread_create(&context->threads[i], NULL, applyConstraintsWorker, &works[i]);
+    }
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        pthread_join(context->threads[i], NULL);
+    }
+    
+    free(works);
+}
+
+void* updatePositionsWorker(void* arg)
+{
+    ThreadWork* work = (ThreadWork*)arg;
+    float dt = work->context->dt;
+    
+    for (int i = work->startIdx; i < work->endIdx; i++) {
+        VerletObject* obj = &work->context->objects[i];
+        mfloat_t velocity[VEC3_SIZE];
+        vec3_subtract(velocity, obj->current, obj->previous);
+        
+        vec3_assign(obj->previous, obj->current);
+        
+        mfloat_t accel_term[VEC3_SIZE];
+        vec3_multiply_f(accel_term, obj->acceleration, dt * dt);
+        vec3_add(obj->current, obj->current, velocity);
+        vec3_add(obj->current, obj->current, accel_term);
+        
+        vec3_zero(obj->acceleration);
+    }
+    
+    return NULL;
+}
+
+void updatePositionsPthread(VerletObject* objects, int count, float dt, ParallelContext* context)
+{
+    context->objects = objects;
+    context->numActive = count;
+    context->dt = dt;
+    
+    int chunkSize = (count + context->numThreads - 1) / context->numThreads;
+    ThreadWork* works = malloc(sizeof(ThreadWork) * context->numThreads);
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        works[i].context = context;
+        works[i].threadId = i;
+        works[i].startIdx = i * chunkSize;
+        works[i].endIdx = (i + 1) * chunkSize;
+        if (works[i].endIdx > count) works[i].endIdx = count;
+        
+        pthread_create(&context->threads[i], NULL, updatePositionsWorker, &works[i]);
+    }
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        pthread_join(context->threads[i], NULL);
+    }
+    
+    free(works);
+}
+
+void* applyCollisionsWorker(void* arg)
+{
+    ThreadWork* work = (ThreadWork*)arg;
+    int count = work->context->numActive;
+    VerletObject* objects = work->context->objects;
+    
+    // Each thread handles a subset of objects
+    for (int i = work->startIdx; i < work->endIdx; i++) {
+        for (int j = i + 1; j < count; j++) {
+            mfloat_t diff[VEC3_SIZE];
+            vec3_subtract(diff, objects[i].current, objects[j].current);
+            float dist = vec3_length(diff);
+            float minDist = objects[i].radius + objects[j].radius;
+            
+            if (dist < minDist && dist > 0.0001f) {
+                mfloat_t n[VEC3_SIZE];
+                vec3_normalize(n, diff);
+                float delta = minDist - dist;
+                vec3_multiply_f(n, n, delta * 0.5f);
+                
+                vec3_add(objects[i].current, objects[i].current, n);
+                vec3_subtract(objects[j].current, objects[j].current, n);
+            }
+        }
+    }
+    
+    return NULL;
+}
+
+void applyGridCollisionsPthread(VerletObject* objects, int count, ParallelContext* context)
+{
+    context->objects = objects;
+    context->numActive = count;
+    
+    int chunkSize = (count + context->numThreads - 1) / context->numThreads;
+    ThreadWork* works = malloc(sizeof(ThreadWork) * context->numThreads);
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        works[i].context = context;
+        works[i].threadId = i;
+        works[i].startIdx = i * chunkSize;
+        works[i].endIdx = (i + 1) * chunkSize;
+        if (works[i].endIdx > count) works[i].endIdx = count;
+        
+        pthread_create(&context->threads[i], NULL, applyCollisionsWorker, &works[i]);
+    }
+    
+    for (int i = 0; i < context->numThreads; i++) {
+        pthread_join(context->threads[i], NULL);
+    }
+    
+    free(works);
+}
+
+// ==================== GPU COMPUTE SHADER IMPLEMENTATIONS ====================
+
+unsigned int createComputeShader(const char* computePath)
+{
+    FILE* file = fopen(computePath, "r");
+    if (!file) {
+        printf("Failed to open compute shader: %s\n", computePath);
+        return 0;
+    }
+    
+    fseek(file, 0, SEEK_END);
+    long length = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    char* source = malloc(length + 1);
+    fread(source, 1, length, file);
+    source[length] = '\0';
+    fclose(file);
+    
+    unsigned int shader = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(shader, 1, (const char**)&source, NULL);
+    glCompileShader(shader);
+    
+    int success;
+    char infoLog[512];
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        printf("Compute shader compilation failed:\n%s\n", infoLog);
+        free(source);
+        return 0;
+    }
+    
+    unsigned int program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        glGetProgramInfoLog(program, 512, NULL, infoLog);
+        printf("Compute shader linking failed:\n%s\n", infoLog);
+    }
+    
+    glDeleteShader(shader);
+    free(source);
+    
+    return program;
+}
+
+void initGPUBuffers(Mesh* mesh, int maxInstances)
+{
+    // Create Shader Storage Buffer Objects for GPU compute
+    glGenBuffers(1, &positionSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, positionSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, maxInstances * 3 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    
+    glGenBuffers(1, &velocitySSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, velocitySSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, maxInstances * 3 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    
+    glGenBuffers(1, &previousSSBO);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, previousSSBO);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, maxInstances * 3 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+void cleanupGPUBuffers()
+{
+    if (positionSSBO) glDeleteBuffers(1, &positionSSBO);
+    if (velocitySSBO) glDeleteBuffers(1, &velocitySSBO);
+    if (previousSSBO) glDeleteBuffers(1, &previousSSBO);
+}
+
+void updatePhysicsGPU(unsigned int computeShader, Mesh* mesh, int numActive, float dt, int substeps, mfloat_t* containerPos)
+{
+    glUseProgram(computeShader);
+    
+    // Bind SSBOs
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, positionSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, velocitySSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, previousSSBO);
+    
+    // Set uniforms
+    glUniform1f(glGetUniformLocation(computeShader, "dt"), dt / substeps);
+    glUniform1i(glGetUniformLocation(computeShader, "numObjects"), numActive);
+    glUniform3f(glGetUniformLocation(computeShader, "containerPos"), 
+                containerPos[0], containerPos[1], containerPos[2]);
+    glUniform1f(glGetUniformLocation(computeShader, "containerRadius"), CONTAINER_RADIUS);
+    glUniform1f(glGetUniformLocation(computeShader, "objectRadius"), VERLET_RADIUS);
+    
+    // Dispatch compute shader for each substep
+    for (int i = 0; i < substeps; i++) {
+        glDispatchCompute((numActive + 255) / 256, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+    
+    // Copy results back to rendering buffers
+    glBindBuffer(GL_COPY_READ_BUFFER, positionSSBO);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, mesh->positionVBO);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 
+                        0, 0, numActive * 3 * sizeof(float));
+    
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    glUseProgram(0);
+}
+
+void updatePhysicsHybrid(unsigned int computeShader, Mesh* mesh, VerletObject* objects, 
+                         int numActive, float dt, int substeps, mfloat_t* containerPos)
+{
+    // Hybrid approach: CPU for spatial partitioning, GPU for physics
+    // This is a simplified version - in practice you'd do more sophisticated load balancing
+    
+    int cpuObjects = numActive / 4;  // 25% on CPU
+    int gpuObjects = numActive - cpuObjects;  // 75% on GPU
+    
+    // CPU portion (using OpenMP)
+    float sub_dt = dt / substeps;
+    for (int i = 0; i < substeps; i++) {
+        applyForcesOpenMP(objects, cpuObjects);
+        applyConstraintsOpenMP(objects, cpuObjects, containerPos);
+        updatePositionsOpenMP(objects, cpuObjects, sub_dt);
+    }
+    
+    // GPU portion
+    if (gpuObjects > 0) {
+        updatePhysicsGPU(computeShader, mesh, gpuObjects, dt, substeps, containerPos);
+    }
+    
+    // Copy CPU results to rendering buffer
+    float* positions = malloc(cpuObjects * 3 * sizeof(float));
+    for (int i = 0; i < cpuObjects; i++) {
+        positions[i * 3 + 0] = objects[i].current[0];
+        positions[i * 3 + 1] = objects[i].current[1];
+        positions[i * 3 + 2] = objects[i].current[2];
+    }
+    
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->positionVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, cpuObjects * 3 * sizeof(float), positions);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    
+    free(positions);
+}
